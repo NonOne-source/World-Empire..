@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
+// @ts-ignore - avoids type-declaration resolution issues for this three.js version in CI
 import * as THREE from "three";
+// @ts-ignore - three ships no bundled types for the examples/jsm/* import paths
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 // @ts-ignore - topojson-client ships no bundled TypeScript declarations
 import { feature } from "topojson-client";
@@ -178,8 +180,8 @@ export function Globe({ game, activeCityId }: GlobeProps) {
     let lastActiveCity = "";
 
     function resize() {
-      const w = container.clientWidth;
-      const h = container.clientHeight;
+      const w = container!.clientWidth;
+      const h = container!.clientHeight;
       camera.aspect = w / h || 1;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
