@@ -1,0 +1,369 @@
+import { useEffect, useRef, useState } from "react";
+// @ts-ignore - avoids type-declaration resolution issues for this three.js version in CI
+import * as THREE from "three";
+// @ts-ignore - three ships no bundled types for the examples/jsm/* import paths
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+// @ts-ignore - topojson-client ships no bundled TypeScript declarations
+import { feature } from "topojson-client";
+// world-atlas ships pre-simplified (110m resolution) TopoJSON country borders —
+// small enough to bundle, detailed enough to be recognizable as a real world map.
+// This is the real geographic data source the Phase 1 README said Phase 2 would add.
+// @ts-ignore - no type declarations shipped for this JSON import
+import worldTopology from "world-atlas/countries-110m.json";
+import type { GameState } from "./main";
+import { CITIES, BOARD_ORDER } from "./cities";
+
+const GLOBE_RADIUS = 2;
+const MARKER_RADIUS = GLOBE_RADIUS * 1.01;
+const BORDER_RADIUS = GLOBE_RADIUS * 1.002;
+
+function latLonToVector3(lat: number, lon: number, radius: number): THREE.Vector3 {
+  const phi = (90 - lat) * (Math.PI / 180);
+  const theta = (lon + 180) * (Math.PI / 180);
+  return new THREE.Vector3(
+    -radius * Math.sin(phi) * Math.cos(theta),
+    radius * Math.cos(phi),
+    radius * Math.sin(phi) * Math.sin(theta)
+  );
+}
+
+interface GlobeProps {
+  game: GameState;
+  activeCityId: string;
+}
+
+export function Globe({ game, activeCityId }: GlobeProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [hoveredCityId, setHoveredCityId] = useState<string | null>(null);
+  const [pinnedCityId, setPinnedCityId] = useState<string | null>(null);
+
+  // Refs so the render loop (which is set up once) always sees fresh game/activeCityId
+  // without re-creating the whole Three.js scene on every state update.
+  const gameRef = useRef(game);
+  gameRef.current = game;
+  const activeCityRef = useRef(activeCityId);
+  activeCityRef.current = activeCityId;
+  // Tracks each player's last-known board index so we can detect a move and replay
+  // it city-by-city instead of teleporting straight to the destination.
+  const prevPositionsRef = useRef<Record<string, number>>({});
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+    camera.position.set(0, 0, 5.2);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    container.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.minDistance = 3.2;
+    controls.maxDistance = 8;
+    controls.rotateSpeed = 0.5;
+    controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
+
+    // --- Base sphere (ocean) ---
+    const sphereGeo = new THREE.SphereGeometry(GLOBE_RADIUS, 64, 64);
+    const sphereMat = new THREE.MeshPhongMaterial({
+      color: new THREE.Color("#101a33"),
+      emissive: new THREE.Color("#0a1226"),
+      shininess: 6,
+    });
+    scene.add(new THREE.Mesh(sphereGeo, sphereMat));
+
+    // --- Soft atmosphere glow shell ---
+    const glowGeo = new THREE.SphereGeometry(GLOBE_RADIUS * 1.04, 48, 48);
+    const glowMat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color("#3e8e7e"),
+      transparent: true,
+      opacity: 0.08,
+      side: THREE.BackSide,
+    });
+    scene.add(new THREE.Mesh(glowGeo, glowMat));
+
+    // --- Lights ---
+    scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+    const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+    sun.position.set(4, 3, 5);
+    scene.add(sun);
+
+    // --- Country borders from real GeoJSON (converted from TopoJSON at runtime) ---
+    const countries = feature(worldTopology as any, (worldTopology as any).objects.countries) as any;
+    const borderPositions: number[] = [];
+    for (const geom of countries.features) {
+      const polygons: number[][][][] =
+        geom.geometry.type === "Polygon" ? [geom.geometry.coordinates] : geom.geometry.coordinates;
+      for (const polygon of polygons) {
+        for (const ring of polygon) {
+          for (let i = 0; i < ring.length - 1; i++) {
+            const [lon1, lat1] = ring[i];
+            const [lon2, lat2] = ring[i + 1];
+            const p1 = latLonToVector3(lat1, lon1, BORDER_RADIUS);
+            const p2 = latLonToVector3(lat2, lon2, BORDER_RADIUS);
+            borderPositions.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z);
+          }
+        }
+      }
+    }
+    const borderGeo = new THREE.BufferGeometry();
+    borderGeo.setAttribute("position", new THREE.Float32BufferAttribute(borderPositions, 3));
+    const borderMat = new THREE.LineBasicMaterial({ color: new THREE.Color("#8b96b8"), transparent: true, opacity: 0.55 });
+    scene.add(new THREE.LineSegments(borderGeo, borderMat));
+
+    // --- Route line: shows the fixed travel order between cities, so players can see
+    //     *which direction* the board goes and roughly how far a roll of N will take them. ---
+    const ROUTE_RADIUS = GLOBE_RADIUS * 1.015;
+    const routePoints = BOARD_ORDER.map((id) => {
+      const c = CITIES[id];
+      return latLonToVector3(c.lat, c.lon, ROUTE_RADIUS);
+    });
+    routePoints.push(routePoints[0].clone()); // close the loop back to the first city
+    const routeGeo = new THREE.BufferGeometry().setFromPoints(routePoints);
+    const routeMat = new THREE.LineDashedMaterial({
+      color: new THREE.Color("#c9a227"),
+      dashSize: 0.06,
+      gapSize: 0.04,
+      transparent: true,
+      opacity: 0.75,
+    });
+    const routeLine = new THREE.Line(routeGeo, routeMat);
+    routeLine.computeLineDistances(); // required for dashed materials to render correctly
+    scene.add(routeLine);
+
+    // --- City markers ---
+    const markerGroup = new THREE.Group();
+    const markerMeshes: THREE.Mesh[] = [];
+    const goldColor = new THREE.Color("#c9a227");
+    for (const city of Object.values(CITIES)) {
+      const pos = latLonToVector3(city.lat, city.lon, MARKER_RADIUS);
+      const geo = new THREE.SphereGeometry(0.03, 12, 12);
+      const owner = gameRef.current.players.find((p) => p.id === gameRef.current.cities[city.id]?.ownerId);
+      const mat = new THREE.MeshBasicMaterial({ color: owner ? new THREE.Color(owner.color) : goldColor });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.copy(pos);
+      mesh.userData.cityId = city.id;
+      markerGroup.add(mesh);
+      markerMeshes.push(mesh);
+    }
+    scene.add(markerGroup);
+
+    // --- Player tokens: one small ball per player that hops city-by-city along the
+    //     route whenever a dice roll changes their position, instead of teleporting
+    //     straight to the destination. ---
+    interface PlayerToken {
+      mesh: THREE.Mesh;
+      positions: THREE.Vector3[]; // full hop path for the move in progress; length 1 = idle
+      segIndex: number;
+      segStart: number;
+    }
+    const TOKEN_RADIUS = MARKER_RADIUS + 0.02;
+    const HOP_MS = 260;
+    const tokenGroup = new THREE.Group();
+    const playerTokens: Record<string, PlayerToken> = {};
+
+    for (const player of gameRef.current.players) {
+      const cityDef = CITIES[BOARD_ORDER[player.position]];
+      if (!cityDef) continue;
+      const startPos = latLonToVector3(cityDef.lat, cityDef.lon, TOKEN_RADIUS);
+      const geo = new THREE.SphereGeometry(0.045, 14, 14);
+      const mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(player.color) });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.copy(startPos);
+      tokenGroup.add(mesh);
+      playerTokens[player.id] = { mesh, positions: [startPos], segIndex: 0, segStart: performance.now() };
+      prevPositionsRef.current[player.id] = player.position;
+    }
+    scene.add(tokenGroup);
+
+    // Builds the full sequence of intermediate city positions between two board
+    // indices (always stepping forward, matching how dice moves work) so the token
+    // can visibly hop through every city it passes, not just land on the final one.
+    function startHop(playerId: string, fromIdx: number, toIdx: number) {
+      const token = playerTokens[playerId];
+      if (!token) return;
+      const total = BOARD_ORDER.length;
+      const positions: THREE.Vector3[] = [latLonToVector3(CITIES[BOARD_ORDER[fromIdx]].lat, CITIES[BOARD_ORDER[fromIdx]].lon, TOKEN_RADIUS)];
+      let idx = fromIdx;
+      let guard = 0;
+      while (idx !== toIdx && guard <= total) {
+        idx = (idx + 1) % total;
+        const c = CITIES[BOARD_ORDER[idx]];
+        positions.push(latLonToVector3(c.lat, c.lon, TOKEN_RADIUS));
+        guard++;
+      }
+      token.positions = positions;
+      token.segIndex = 0;
+      token.segStart = performance.now();
+    }
+
+    // Pulsing ring highlighting whichever city the current player just landed on.
+    const activeRingGeo = new THREE.RingGeometry(0.05, 0.07, 32);
+    const activeRingMat = new THREE.MeshBasicMaterial({ color: goldColor, transparent: true, side: THREE.DoubleSide });
+    const activeRing = new THREE.Mesh(activeRingGeo, activeRingMat);
+    scene.add(activeRing);
+
+    // --- Raycasting for tap/click selection ---
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+
+    function pickCity(clientX: number, clientY: number): string | null {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const hits = raycaster.intersectObjects(markerMeshes);
+      return hits.length > 0 ? (hits[0].object.userData.cityId as string) : null;
+    }
+
+    function handleClick(e: PointerEvent) {
+      const cityId = pickCity(e.clientX, e.clientY);
+      if (cityId) setPinnedCityId(cityId);
+    }
+    function handleMove(e: PointerEvent) {
+      if (e.pointerType === "touch") return; // avoid flicker on touch drag
+      setHoveredCityId(pickCity(e.clientX, e.clientY));
+    }
+    renderer.domElement.addEventListener("click", handleClick);
+    renderer.domElement.addEventListener("pointermove", handleMove);
+
+    // --- Camera fly-to a city (used when a new city becomes "active") ---
+    let flyFrom: THREE.Vector3 | null = null;
+    let flyTo: THREE.Vector3 | null = null;
+    let flyStart = 0;
+    const FLY_MS = 900;
+
+    function flyToCity(cityId: string) {
+      const city = CITIES[cityId];
+      if (!city) return;
+      const dir = latLonToVector3(city.lat, city.lon, 1);
+      const targetDistance = camera.position.length();
+      flyFrom = camera.position.clone().normalize();
+      flyTo = dir.clone();
+      flyStart = performance.now();
+      controls.enabled = false;
+      (flyToCity as any)._targetDistance = targetDistance;
+    }
+
+    let lastActiveCity = "";
+
+    function resize() {
+      const w = container!.clientWidth;
+      const h = container!.clientHeight;
+      camera.aspect = w / h || 1;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    }
+    const resizeObserver = new ResizeObserver(resize);
+    resizeObserver.observe(container);
+    resize();
+
+    let raf = 0;
+    function animate(now: number) {
+      raf = requestAnimationFrame(animate);
+
+      if (gameRef.current && activeCityRef.current !== lastActiveCity) {
+        lastActiveCity = activeCityRef.current;
+        flyToCity(lastActiveCity);
+      }
+
+      if (flyFrom && flyTo) {
+        const t = Math.min(1, (now - flyStart) / FLY_MS);
+        const eased = 1 - Math.pow(1 - t, 3);
+        const dir = flyFrom.clone().lerp(flyTo, eased).normalize();
+        const distance = (flyToCity as any)._targetDistance ?? camera.position.length();
+        camera.position.copy(dir.multiplyScalar(distance));
+        camera.lookAt(0, 0, 0);
+        if (t >= 1) {
+          flyFrom = null;
+          flyTo = null;
+          controls.enabled = true;
+        }
+      }
+
+      // Update active-city ring position + pulse
+      const cityId = activeCityRef.current;
+      const cityDef = CITIES[cityId];
+      if (cityDef) {
+        const pos = latLonToVector3(cityDef.lat, cityDef.lon, MARKER_RADIUS + 0.001);
+        activeRing.position.copy(pos);
+        activeRing.lookAt(pos.clone().multiplyScalar(2));
+        const pulse = 0.7 + 0.3 * Math.sin(now / 250);
+        activeRing.scale.setScalar(pulse);
+        activeRingMat.opacity = 0.5 + 0.4 * Math.sin(now / 250);
+      }
+
+      // Refresh marker colors (ownership can change turn to turn)
+      for (const mesh of markerMeshes) {
+        const cid = mesh.userData.cityId as string;
+        const owner = gameRef.current.players.find((p) => p.id === gameRef.current.cities[cid]?.ownerId);
+        (mesh.material as THREE.MeshBasicMaterial).color.set(owner ? owner.color : "#c9a227");
+      }
+
+      // Detect position changes and kick off a fresh hop sequence for that player.
+      for (const player of gameRef.current.players) {
+        const prev = prevPositionsRef.current[player.id];
+        const token = playerTokens[player.id];
+        if (prev === undefined) {
+          prevPositionsRef.current[player.id] = player.position;
+          continue;
+        }
+        const idle = !token || token.segIndex >= token.positions.length - 1;
+        if (prev !== player.position && idle) {
+          startHop(player.id, prev, player.position);
+          prevPositionsRef.current[player.id] = player.position;
+        }
+      }
+
+      // Advance any in-progress hop animations.
+      for (const token of Object.values(playerTokens)) {
+        if (token.segIndex >= token.positions.length - 1) continue;
+        const t = Math.min(1, (now - token.segStart) / HOP_MS);
+        const a = token.positions[token.segIndex];
+        const b = token.positions[token.segIndex + 1];
+        const lift = Math.sin(t * Math.PI) * 0.08;
+        const pos = a.clone().lerp(b, t).normalize().multiplyScalar(TOKEN_RADIUS + lift);
+        token.mesh.position.copy(pos);
+        if (t >= 1) {
+          token.segIndex += 1;
+        }
+      }
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    raf = requestAnimationFrame(animate);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      resizeObserver.disconnect();
+      renderer.domElement.removeEventListener("click", handleClick);
+      renderer.domElement.removeEventListener("pointermove", handleMove);
+      controls.dispose();
+      renderer.dispose();
+      container.removeChild(renderer.domElement);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const shownCityId = hoveredCityId ?? pinnedCityId;
+  const shownCity = shownCityId ? CITIES[shownCityId] : null;
+
+  return (
+    <div className="globe-panel card">
+      <div ref={containerRef} className="globe-canvas" />
+      <div className="globe-hint">📍 {CITIES[activeCityId]?.name}, {CITIES[activeCityId]?.country}</div>
+      {shownCity && (
+        <div className="globe-tooltip">
+          <strong>{shownCity.name}</strong>
+          <span>{shownCity.country}</span>
+          <span className="mono">€{shownCity.price.toLocaleString("de-DE")}</span>
+        </div>
+      )}
+    </div>
+  );
+}
