@@ -12,6 +12,7 @@ interface Player {
   bankrupt: boolean;
   rentCollected: number;
   rentPaid: number;
+  isBot: boolean;
 }
 
 interface CityState {
@@ -70,6 +71,7 @@ interface GameState {
   settings: RoomSettings;
   chat: ChatMessage[];
   round: number;
+  turnDeadline: number | null;
 }
 
 type ClientMessage =
@@ -89,7 +91,9 @@ type ClientMessage =
   | { type: "mortgage_property"; cityId: string }
   | { type: "unmortgage_property"; cityId: string }
   | { type: "send_chat"; text: string }
-  | { type: "rematch" };
+  | { type: "rematch" }
+  | { type: "add_bot" }
+  | { type: "remove_bot"; botId: string };
 
 type ServerMessage = { type: "state"; state: GameState; you: string } | { type: "error"; message: string };
 
@@ -127,6 +131,8 @@ const BOARD_ORDER: string[] = [
 const GO_BONUS = 400;
 const STARTING_MONEY = 12500;
 const PLAYER_COLORS = ["#C9A227", "#3E8E7E", "#B8543F", "#6C7DD9", "#D98E4A", "#9B6BC9"];
+const BOT_NAMES = ["Bot Aurora", "Bot Falke", "Bot Krake", "Bot Komet", "Bot Titan", "Bot Yuki"];
+const BOT_AVATARS = ["🤖", "👾", "🛰️", "⚙️"];
 
 /* ======================= Random events (30 cards) ======================= */
 
@@ -230,6 +236,7 @@ export class GameRoom {
       settings: { startingMoney: STARTING_MONEY, maxRounds: null, eventsEnabled: true },
       chat: [],
       round: 1,
+      turnDeadline: null,
     };
     this.game = fresh;
     await this.persist();
@@ -278,7 +285,10 @@ export class GameRoom {
           case "unmortgage_property": this.handleUnmortgage(playerId, msg.cityId); break;
           case "send_chat": this.handleSendChat(playerId, msg.text); break;
           case "rematch": this.handleRematch(playerId); break;
+          case "add_bot": this.handleAddBot(playerId); break;
+          case "remove_bot": this.handleRemoveBot(playerId, msg.botId); break;
         }
+        this.scheduleNextAlarm();
         await this.persist();
         this.broadcast();
       } catch {
@@ -324,6 +334,7 @@ export class GameRoom {
         bankrupt: false,
         rentCollected: 0,
         rentPaid: 0,
+        isBot: false,
       };
       game.players.push(player);
       playerId = player.id;
@@ -346,6 +357,7 @@ export class GameRoom {
     game.turnPhase = "awaiting_roll";
     game.currentPlayerIndex = 0;
     game.round = 1;
+    game.turnDeadline = Date.now() + 45000;
     this.addLog("Das Spiel hat begonnen.");
   }
 
@@ -357,6 +369,42 @@ export class GameRoom {
     const maxRounds = settings.maxRounds && settings.maxRounds > 0 ? Math.min(200, Math.round(settings.maxRounds)) : null;
     game.settings = { startingMoney, maxRounds, eventsEnabled: !!settings.eventsEnabled };
     this.addLog(`${player.name} hat die Spieleinstellungen angepasst.`);
+  }
+
+  private handleAddBot(playerId: string) {
+    const game = this.game!;
+    const player = game.players.find((p) => p.id === playerId);
+    if (!player?.isHost || game.phase !== "lobby") return;
+    if (game.players.length >= PLAYER_COLORS.length) return;
+    const usedColors = new Set(game.players.map((p) => p.color));
+    const freeColor = PLAYER_COLORS.find((c) => !usedColors.has(c)) ?? PLAYER_COLORS[0];
+    const usedNames = new Set(game.players.map((p) => p.name));
+    const botName = BOT_NAMES.find((n) => !usedNames.has(n)) ?? `Bot ${game.players.length + 1}`;
+    const bot: Player = {
+      id: crypto.randomUUID(),
+      name: botName,
+      color: freeColor,
+      avatar: BOT_AVATARS[Math.floor(Math.random() * BOT_AVATARS.length)],
+      money: game.startingMoney,
+      position: 0,
+      isHost: false,
+      connected: true,
+      bankrupt: false,
+      rentCollected: 0,
+      rentPaid: 0,
+      isBot: true,
+    };
+    game.players.push(bot);
+    this.addLog(`${botName} (Bot) wurde hinzugefügt.`);
+  }
+
+  private handleRemoveBot(playerId: string, botId: string) {
+    const game = this.game!;
+    const player = game.players.find((p) => p.id === playerId);
+    if (!player?.isHost || game.phase !== "lobby") return;
+    const bot = game.players.find((p) => p.id === botId && p.isBot);
+    if (!bot) return;
+    game.players = game.players.filter((p) => p.id !== botId);
   }
 
   private currentPlayer(): Player | undefined {
@@ -499,6 +547,7 @@ export class GameRoom {
     game.auction = null;
     game.winnerId = null;
     game.round = 1;
+    game.turnDeadline = null;
     this.addLog("Neue Runde vorbereitet — der Host kann wieder starten.");
   }
 
@@ -574,6 +623,7 @@ export class GameRoom {
     game.currentPlayerIndex = next;
     game.turnPhase = "awaiting_roll";
     game.lastDice = null;
+    game.turnDeadline = Date.now() + 45000;
   }
 
   private checkBankruptcy(player: Player) {
@@ -599,7 +649,6 @@ export class GameRoom {
     const endsAt = Date.now() + 20000;
     game.auction = { cityId, currentBid: startBid, currentBidderId: null, endsAt, triggeredByPlayerId };
     this.addLog(`Auktion für ${cityDef.name} gestartet — Startgebot €${startBid} (20 Sekunden).`);
-    this.state.storage.setAlarm(endsAt);
   }
 
   private handlePlaceBid(playerId: string, amount: number) {
@@ -614,15 +663,90 @@ export class GameRoom {
     this.addLog(`${bidder.name} bietet €${game.auction.currentBid} für ${cityDef.name}.`);
   }
 
-  // Called by the platform when the auction's alarm fires (~20s after startAuction),
-  // even if this Durable Object had no other reason to be active at that moment.
+  // Central scheduler: figures out the SOONEST reason this room needs to "wake up" on its own —
+  // an auction ending, a bot needing to take its next action, or a human's turn timer expiring —
+  // and books exactly one Durable Object alarm for that moment. Called after every state change.
+  private scheduleNextAlarm() {
+    const game = this.game;
+    if (!game) return;
+    const candidates: number[] = [];
+    if (game.auction) candidates.push(game.auction.endsAt);
+    if (game.phase === "playing" && !game.auction) {
+      const cp = game.players[game.currentPlayerIndex];
+      if (cp && !cp.bankrupt) {
+        if (cp.isBot) candidates.push(Date.now() + 1100);
+        else if (game.turnDeadline) candidates.push(game.turnDeadline);
+      }
+    }
+    if (candidates.length > 0) this.state.storage.setAlarm(Math.min(...candidates));
+  }
+
+  // Called by the platform whenever a scheduled alarm fires — resolves an ended auction, makes a
+  // bot's next move, or auto-skips a human who ran out of time. Always re-schedules afterwards.
   async alarm() {
     const stored = await this.state.storage.get<GameState>("game");
-    if (!stored || !stored.auction) return;
+    if (!stored) return;
     this.game = stored;
-    this.resolveAuction();
+    const game = this.game;
+
+    if (game.auction && Date.now() >= game.auction.endsAt) {
+      this.resolveAuction();
+    } else if (game.phase === "playing" && !game.auction) {
+      const cp = game.players[game.currentPlayerIndex];
+      if (cp && !cp.bankrupt) {
+        if (cp.isBot) {
+          this.performBotTurn(cp);
+        } else if (game.turnDeadline && Date.now() >= game.turnDeadline) {
+          this.autoAdvanceStuckPlayer(cp);
+        }
+      }
+    }
+
+    this.scheduleNextAlarm();
     await this.persist();
     this.broadcast();
+  }
+
+  // Runs a bot's entire turn synchronously by calling the same validated handlers a human's
+  // messages would trigger — roll, then a simple buy/skip decision, then an occasional upgrade,
+  // then end turn. Stops early if it lands on an auction, which resolves itself via its own alarm.
+  private performBotTurn(player: Player) {
+    const game = this.game!;
+    this.handleRollDice(player.id);
+    if (game.auction) return;
+
+    if (game.turnPhase === "awaiting_action") {
+      const cityId = BOARD_ORDER[player.position];
+      const cityDef = CITIES[cityId];
+      if (cityDef && player.money - cityDef.price >= 300) this.handleBuyProperty(player.id);
+      else this.handleSkipPurchase(player.id);
+      if (game.auction) return;
+    }
+
+    if (game.turnPhase === "awaiting_end") {
+      const owned = Object.values(game.cities).filter((c) => c.ownerId === player.id && c.developmentLevel < 4 && !c.mortgaged);
+      if (owned.length > 0 && Math.random() < 0.3) {
+        const target = owned[Math.floor(Math.random() * owned.length)];
+        const cost = Math.round(CITIES[target.id].price * 0.5 * (target.developmentLevel + 1));
+        if (player.money - cost >= 500) this.handleUpgradeProperty(player.id, target.id);
+      }
+      this.handleEndTurn(player.id);
+    }
+  }
+
+  // A human who hasn't acted within the turn timer gets gracefully skipped from wherever they
+  // are stuck, so one AFK player never blocks the whole room.
+  private autoAdvanceStuckPlayer(player: Player) {
+    const game = this.game!;
+    this.addLog(`${player.name} war zu langsam und wird übersprungen.`);
+    if (game.turnPhase === "awaiting_roll") {
+      this.advanceTurn();
+    } else if (game.turnPhase === "awaiting_action") {
+      this.handleSkipPurchase(player.id);
+      if (this.game!.turnPhase === "awaiting_end" && !this.game!.auction) this.handleEndTurn(player.id);
+    } else if (game.turnPhase === "awaiting_end") {
+      this.handleEndTurn(player.id);
+    }
   }
 
   private resolveAuction() {
