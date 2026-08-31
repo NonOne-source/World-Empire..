@@ -957,3 +957,131 @@ input:focus-visible,
     grid-template-columns: 1fr 1fr;
   }
 }
+
+/* ---- Invite / QR code ---- */
+
+.invite-btn {
+  margin: 0.3rem 0 0.6rem;
+  width: 100%;
+}
+
+.invite-card {
+  width: min(360px, 100%);
+  align-items: center;
+  text-align: center;
+}
+
+.qr-canvas {
+  border-radius: 8px;
+  margin: 0.4rem auto;
+  display: block;
+}
+
+.invite-url {
+  word-break: break-all;
+  font-size: 0.72rem;
+}
+
+/* ---- Bots ---- */
+
+.lobby-bot-tag {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  color: var(--teal);
+  border: 1px solid var(--teal);
+  border-radius: 4px;
+  padding: 0.05rem 0.35rem;
+  margin-left: 0.3rem;
+}
+
+.bot-remove-btn {
+  background: none;
+  border: none;
+  color: var(--brick);
+  font-size: 0.75rem;
+  margin-left: 0.4rem;
+  cursor: pointer;
+  padding: 0 0.2rem;
+}
+
+/* ---- Turn timer ---- */
+
+.turn-timer {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-right: 0.6rem;
+}
+
+.turn-timer.is-urgent {
+  color: var(--brick);
+  font-weight: 700;
+}
+
+/* ---- Globe loading fallback ---- */
+
+.globe-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  color: var(--muted);
+}
+
+/* ---- Error toast ---- */
+
+.error-toast {
+  position: fixed;
+  bottom: 90px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(184, 84, 63, 0.95);
+  color: var(--parchment);
+  padding: 0.6rem 1rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  z-index: 30;
+  animation: toast-in-out 4s ease forwards;
+  max-width: 90vw;
+  text-align: center;
+}
+
+@keyframes toast-in-out {
+  0% { opacity: 0; transform: translateX(-50%) translateY(10px); }
+  8% { opacity: 1; transform: translateX(-50%) translateY(0); }
+  88% { opacity: 1; }
+  100% { opacity: 0; transform: translateX(-50%) translateY(10px); }
+}
+
+/* ---- Confetti ---- */
+
+.confetti-layer {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 5;
+}
+
+.confetti-piece {
+  position: absolute;
+  top: -5%;
+  width: 8px;
+  height: 14px;
+  opacity: 0.9;
+  animation-name: confetti-fall;
+  animation-timing-function: ease-in;
+  animation-iteration-count: 1;
+  animation-fill-mode: forwards;
+}
+
+@keyframes confetti-fall {
+  0% { top: -5%; opacity: 1; }
+  100% { top: 105%; opacity: 0.7; transform: translateX(var(--drift)) rotate(540deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .confetti-piece, .error-toast {
+    animation: none;
+  }
+}
