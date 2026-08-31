@@ -43,9 +43,6 @@ export function Globe({ game, activeCityId }: GlobeProps) {
   gameRef.current = game;
   const activeCityRef = useRef(activeCityId);
   activeCityRef.current = activeCityId;
-  // Tracks each player's last-known board index so we can detect a move and replay
-  // it city-by-city instead of teleporting straight to the destination.
-  const prevPositionsRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
     const container = containerRef.current;
@@ -152,55 +149,6 @@ export function Globe({ game, activeCityId }: GlobeProps) {
     }
     scene.add(markerGroup);
 
-    // --- Player tokens: one small ball per player that hops city-by-city along the
-    //     route whenever a dice roll changes their position, instead of teleporting
-    //     straight to the destination. ---
-    interface PlayerToken {
-      mesh: THREE.Mesh;
-      positions: THREE.Vector3[]; // full hop path for the move in progress; length 1 = idle
-      segIndex: number;
-      segStart: number;
-    }
-    const TOKEN_RADIUS = MARKER_RADIUS + 0.02;
-    const HOP_MS = 260;
-    const tokenGroup = new THREE.Group();
-    const playerTokens: Record<string, PlayerToken> = {};
-
-    for (const player of gameRef.current.players) {
-      const cityDef = CITIES[BOARD_ORDER[player.position]];
-      if (!cityDef) continue;
-      const startPos = latLonToVector3(cityDef.lat, cityDef.lon, TOKEN_RADIUS);
-      const geo = new THREE.SphereGeometry(0.045, 14, 14);
-      const mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(player.color) });
-      const mesh = new THREE.Mesh(geo, mat);
-      mesh.position.copy(startPos);
-      tokenGroup.add(mesh);
-      playerTokens[player.id] = { mesh, positions: [startPos], segIndex: 0, segStart: performance.now() };
-      prevPositionsRef.current[player.id] = player.position;
-    }
-    scene.add(tokenGroup);
-
-    // Builds the full sequence of intermediate city positions between two board
-    // indices (always stepping forward, matching how dice moves work) so the token
-    // can visibly hop through every city it passes, not just land on the final one.
-    function startHop(playerId: string, fromIdx: number, toIdx: number) {
-      const token = playerTokens[playerId];
-      if (!token) return;
-      const total = BOARD_ORDER.length;
-      const positions: THREE.Vector3[] = [latLonToVector3(CITIES[BOARD_ORDER[fromIdx]].lat, CITIES[BOARD_ORDER[fromIdx]].lon, TOKEN_RADIUS)];
-      let idx = fromIdx;
-      let guard = 0;
-      while (idx !== toIdx && guard <= total) {
-        idx = (idx + 1) % total;
-        const c = CITIES[BOARD_ORDER[idx]];
-        positions.push(latLonToVector3(c.lat, c.lon, TOKEN_RADIUS));
-        guard++;
-      }
-      token.positions = positions;
-      token.segIndex = 0;
-      token.segStart = performance.now();
-    }
-
     // Pulsing ring highlighting whichever city the current player just landed on.
     const activeRingGeo = new THREE.RingGeometry(0.05, 0.07, 32);
     const activeRingMat = new THREE.MeshBasicMaterial({ color: goldColor, transparent: true, side: THREE.DoubleSide });
@@ -297,40 +245,18 @@ export function Globe({ game, activeCityId }: GlobeProps) {
         activeRingMat.opacity = 0.5 + 0.4 * Math.sin(now / 250);
       }
 
-      // Refresh marker colors (ownership can change turn to turn)
+      // Refresh marker colors/size (ownership, development level and mortgages can change every turn)
       for (const mesh of markerMeshes) {
         const cid = mesh.userData.cityId as string;
-        const owner = gameRef.current.players.find((p) => p.id === gameRef.current.cities[cid]?.ownerId);
-        (mesh.material as THREE.MeshBasicMaterial).color.set(owner ? owner.color : "#c9a227");
-      }
-
-      // Detect position changes and kick off a fresh hop sequence for that player.
-      for (const player of gameRef.current.players) {
-        const prev = prevPositionsRef.current[player.id];
-        const token = playerTokens[player.id];
-        if (prev === undefined) {
-          prevPositionsRef.current[player.id] = player.position;
-          continue;
-        }
-        const idle = !token || token.segIndex >= token.positions.length - 1;
-        if (prev !== player.position && idle) {
-          startHop(player.id, prev, player.position);
-          prevPositionsRef.current[player.id] = player.position;
-        }
-      }
-
-      // Advance any in-progress hop animations.
-      for (const token of Object.values(playerTokens)) {
-        if (token.segIndex >= token.positions.length - 1) continue;
-        const t = Math.min(1, (now - token.segStart) / HOP_MS);
-        const a = token.positions[token.segIndex];
-        const b = token.positions[token.segIndex + 1];
-        const lift = Math.sin(t * Math.PI) * 0.08;
-        const pos = a.clone().lerp(b, t).normalize().multiplyScalar(TOKEN_RADIUS + lift);
-        token.mesh.position.copy(pos);
-        if (t >= 1) {
-          token.segIndex += 1;
-        }
+        const cityState = gameRef.current.cities[cid];
+        const owner = gameRef.current.players.find((p) => p.id === cityState?.ownerId);
+        const mat = mesh.material as THREE.MeshBasicMaterial;
+        mat.color.set(owner ? owner.color : "#c9a227");
+        mat.opacity = cityState?.mortgaged ? 0.35 : 1;
+        mat.transparent = !!cityState?.mortgaged;
+        const level = cityState?.developmentLevel ?? 0;
+        const scale = 1 + level * 0.35; // taller/bigger marker the more a city is built up
+        mesh.scale.setScalar(scale);
       }
 
       controls.update();
