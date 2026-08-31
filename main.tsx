@@ -1,9 +1,15 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
 import "./styles.css";
 import { CITIES, BOARD_ORDER, PLAYER_COLORS } from "./cities";
-import { Globe } from "./globe";
 import { sounds } from "./sound";
+// @ts-ignore - avoid type-declaration resolution issues for this package in CI
+import QRCode from "qrcode";
+
+// Three.js + topojson + world-atlas are the bulk of the bundle. Loading the globe lazily keeps the
+// lobby screen (which most visits never get past) fast, and only pulls in the heavy chunk once
+// someone actually starts or joins a game.
+const Globe = React.lazy(() => import("./globe").then((m) => ({ default: m.Globe })));
 
 /* ======================= Shared types ======================= */
 
@@ -24,6 +30,7 @@ interface Player {
   bankrupt: boolean;
   rentCollected: number;
   rentPaid: number;
+  isBot: boolean;
 }
 
 interface CityState {
@@ -89,6 +96,7 @@ export interface GameState {
   settings: RoomSettings;
   chat: ChatMessage[];
   round: number;
+  turnDeadline: number | null;
 }
 
 type ClientMessage =
@@ -108,7 +116,9 @@ type ClientMessage =
   | { type: "mortgage_property"; cityId: string }
   | { type: "unmortgage_property"; cityId: string }
   | { type: "send_chat"; text: string }
-  | { type: "rematch" };
+  | { type: "rematch" }
+  | { type: "add_bot" }
+  | { type: "remove_bot"; botId: string };
 
 type ServerMessage =
   | { type: "state"; state: GameState; you: string }
@@ -155,6 +165,7 @@ function useGameSocket(gameId: string | null, name: string, color: string, avata
         } else if (msg.type === "error") {
           setError(msg.message);
           sounds.error();
+          window.setTimeout(() => setError((cur) => (cur === msg.message ? null : cur)), 4000);
         }
       });
 
@@ -366,6 +377,14 @@ function TradePanel({
 function LedgerBar({ game, youId, onRoll, onEndTurn, onSkipDisconnected, onOpenBuild }: { game: GameState; youId: string; onRoll: () => void; onEndTurn: () => void; onSkipDisconnected: () => void; onOpenBuild: () => void }) {
   const current = game.players[game.currentPlayerIndex];
   const isYourTurn = current?.id === youId;
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const secondsLeft = game.turnDeadline ? Math.max(0, Math.ceil((game.turnDeadline - now) / 1000)) : null;
 
   return (
     <div className="ledger-bar card">
@@ -374,12 +393,15 @@ function LedgerBar({ game, youId, onRoll, onEndTurn, onSkipDisconnected, onOpenB
           <div key={p.id} className={`ledger-player${p.id === current?.id ? " is-current" : ""}${p.bankrupt ? " is-bankrupt" : ""}`}>
             <span className="ledger-avatar">{p.avatar}</span>
             <span className="ledger-swatch" style={{ background: p.color }} />
-            <span className="ledger-name">{p.name}{!p.connected && " (getrennt)"}</span>
+            <span className="ledger-name">{p.name}{p.isBot && " 🤖"}{!p.connected && !p.isBot && " (getrennt)"}</span>
             <span className="ledger-money mono">€{p.money.toLocaleString("de-DE")}</span>
           </div>
         ))}
       </div>
       <div className="ledger-action">
+        {secondsLeft !== null && !current?.isBot && (
+          <span className={`turn-timer${secondsLeft <= 10 ? " is-urgent" : ""}`}>⏱ {secondsLeft}s</span>
+        )}
         {game.lastDice && (
           <div className="dice-tray" aria-label={`Würfel: ${game.lastDice[0]} und ${game.lastDice[1]}`}>
             <span className="die">{game.lastDice[0]}</span>
@@ -389,10 +411,12 @@ function LedgerBar({ game, youId, onRoll, onEndTurn, onSkipDisconnected, onOpenB
         {isYourTurn && game.turnPhase === "awaiting_roll" && <button className="btn btn-primary" onClick={onRoll}>Würfeln</button>}
         {isYourTurn && game.turnPhase === "awaiting_end" && <button className="btn" onClick={onOpenBuild}>Ausbauen / Hypothek</button>}
         {isYourTurn && game.turnPhase === "awaiting_end" && <button className="btn btn-primary" onClick={onEndTurn}>Zug beenden</button>}
-        {!isYourTurn && game.phase === "playing" && !current?.connected && (
+        {!isYourTurn && game.phase === "playing" && !current?.connected && !current?.isBot && (
           <button className="btn" onClick={onSkipDisconnected}>Zug überspringen (getrennt)</button>
         )}
-        {!isYourTurn && game.phase === "playing" && current?.connected && <span className="ledger-waiting">Warte auf {current?.name}…</span>}
+        {!isYourTurn && game.phase === "playing" && (current?.connected || current?.isBot) && (
+          <span className="ledger-waiting">Warte auf {current?.name}…</span>
+        )}
       </div>
     </div>
   );
@@ -479,7 +503,40 @@ function PropertyCard({ cityId, game, onBuy, onSkip }: { cityId: string; game: G
   );
 }
 
-/* ======================= LogPanel ======================= */
+/* ======================= Confetti ======================= */
+
+const CONFETTI_COLORS = ["#c9a227", "#3e8e7e", "#b8543f", "#6c7dd9", "#d98e4a", "#9b6bc9"];
+
+function Confetti() {
+  const pieces = Array.from({ length: 60 }, (_, i) => ({
+    id: i,
+    left: Math.random() * 100,
+    delay: Math.random() * 0.6,
+    duration: 2.2 + Math.random() * 1.4,
+    color: CONFETTI_COLORS[i % CONFETTI_COLORS.length],
+    rotate: Math.random() * 360,
+    drift: (Math.random() - 0.5) * 120,
+  }));
+  return (
+    <div className="confetti-layer" aria-hidden="true">
+      {pieces.map((p) => (
+        <span
+          key={p.id}
+          className="confetti-piece"
+          style={{
+            left: `${p.left}%`,
+            background: p.color,
+            animationDelay: `${p.delay}s`,
+            animationDuration: `${p.duration}s`,
+            transform: `rotate(${p.rotate}deg)`,
+            // @ts-ignore - custom property read by the keyframe animation
+            "--drift": `${p.drift}px`,
+          }}
+        />
+      ))}
+    </div>
+  );
+}
 
 /* ======================= BuildPanel ======================= */
 
@@ -609,6 +666,59 @@ function LogPanel({ game }: { game: GameState }) {
 
 /* ======================= Lobby ======================= */
 
+/* ======================= InviteModal ======================= */
+
+function InviteModal({ gameId, onClose }: { gameId: string; onClose: () => void }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const url = `${window.location.origin}${window.location.pathname}?room=${gameId}`;
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (canvasRef.current) {
+      QRCode.toCanvas(canvasRef.current, url, {
+        width: 200,
+        margin: 1,
+        color: { dark: "#0e1425", light: "#ede6d6" },
+      });
+    }
+  }, [url]);
+
+  async function copyLink() {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // clipboard API unavailable — the link is still visible to select manually
+    }
+  }
+
+  const canShare = typeof navigator !== "undefined" && !!(navigator as any).share;
+
+  return (
+    <div className="deed-overlay" onClick={onClose}>
+      <div className="deed card invite-card" onClick={(e) => e.stopPropagation()}>
+        <span className="deed-eyebrow">Einladen</span>
+        <h2 className="display" style={{ marginTop: 0 }}>Freunde einladen</h2>
+        <canvas ref={canvasRef} className="qr-canvas" />
+        <p className="lobby-hint mono invite-url">{url}</p>
+        <div className="deed-actions">
+          <button className="btn" onClick={copyLink}>{copied ? "Kopiert ✓" : "Link kopieren"}</button>
+          {canShare && (
+            <button
+              className="btn btn-primary"
+              onClick={() => (navigator as any).share({ url, title: "World Empire", text: "Tritt meinem Spiel bei!" })}
+            >
+              Teilen
+            </button>
+          )}
+        </div>
+        <button className="btn" style={{ marginTop: "0.6rem", width: "100%" }} onClick={onClose}>Schließen</button>
+      </div>
+    </div>
+  );
+}
+
 function Lobby({
   onEnterRoom,
   game,
@@ -616,6 +726,9 @@ function Lobby({
   connected,
   onStartGame,
   onConfigureRoom,
+  onAddBot,
+  onRemoveBot,
+  initialJoinCode,
 }: {
   onEnterRoom: (id: string, name: string, color: string, avatar: string) => void;
   game: GameState | null;
@@ -623,14 +736,18 @@ function Lobby({
   connected: boolean;
   onStartGame: () => void;
   onConfigureRoom: (settings: RoomSettings) => void;
+  onAddBot: () => void;
+  onRemoveBot: (botId: string) => void;
+  initialJoinCode: string;
 }) {
-  const [mode, setMode] = useState<"choose" | "create" | "join">("choose");
+  const [mode, setMode] = useState<"choose" | "create" | "join">(initialJoinCode ? "join" : "choose");
   const [name, setName] = useState("");
   const [color, setColor] = useState(PLAYER_COLORS[0]);
   const [avatar, setAvatar] = useState(AVATARS[0]);
-  const [joinCode, setJoinCode] = useState("");
+  const [joinCode, setJoinCode] = useState(initialJoinCode);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [inviteOpen, setInviteOpen] = useState(false);
 
   if (game) {
     const you = game.players.find((p) => p.id === youId);
@@ -640,15 +757,25 @@ function Lobby({
           <span className="deed-eyebrow">Wartelobby</span>
           <h1 className="display">Raum {game.gameId}</h1>
           <p className="lobby-hint">Teile diesen Code, damit andere beitreten können.</p>
+          <button className="btn invite-btn" onClick={() => setInviteOpen(true)}>📲 Einladen (Link / QR-Code)</button>
           <ul className="lobby-players">
             {game.players.map((p) => (
               <li key={p.id}>
                 <span className="ledger-avatar">{p.avatar}</span>
                 <span className="ledger-swatch" style={{ background: p.color }} />
-                {p.name} {p.isHost && <span className="lobby-host-tag">Host</span>}
+                {p.name} {p.isHost && <span className="lobby-host-tag">Host</span>}{p.isBot && <span className="lobby-bot-tag">Bot</span>}
+                {p.isBot && youId && game.players.find((h) => h.id === youId)?.isHost && (
+                  <button className="bot-remove-btn" onClick={() => onRemoveBot(p.id)} aria-label="Bot entfernen">✕</button>
+                )}
               </li>
             ))}
           </ul>
+
+          {game.players.find((p) => p.id === youId)?.isHost && game.players.length < PLAYER_COLORS.length && (
+            <button className="btn" onClick={onAddBot}>+ Bot hinzufügen</button>
+          )}
+
+          {inviteOpen && <InviteModal gameId={game.gameId} onClose={() => setInviteOpen(false)} />}
 
           {you?.isHost && (
             <div className="room-settings">
@@ -809,6 +936,7 @@ function App() {
   const [moneyToast, setMoneyToast] = useState<{ id: number; delta: number } | null>(null);
   const prevMoneyRef = useRef<number | null>(null);
   const prevDiceRef = useRef<[number, number] | null>(null);
+  const [initialJoinCode] = useState(() => new URLSearchParams(window.location.search).get("room")?.toUpperCase() ?? "");
 
   const { state, youId, connected, error, send } = useGameSocket(gameId, name, color, avatar);
 
@@ -858,6 +986,9 @@ function App() {
         connected={connected}
         onStartGame={() => send({ type: "start_game" })}
         onConfigureRoom={(settings) => send({ type: "configure_room", settings })}
+        onAddBot={() => send({ type: "add_bot" })}
+        onRemoveBot={(botId) => send({ type: "remove_bot", botId })}
+        initialJoinCode={initialJoinCode}
       />
     );
   }
@@ -872,6 +1003,7 @@ function App() {
     const ranked = [...state.players].sort((a, b) => b.money - a.money);
     return (
       <div className="lobby-shell">
+        {winner && <Confetti />}
         <div className="lobby-card card ranking-card">
           <span className="deed-eyebrow">Spiel beendet</span>
           <h1 className="display">{winner ? `${winner.avatar} ${winner.name} hat gewonnen!` : "Unentschieden"}</h1>
@@ -926,7 +1058,9 @@ function App() {
         </button>
       </header>
       <div className="game-main">
-        <Globe game={state} activeCityId={activeCityId} />
+        <Suspense fallback={<div className="globe-panel card globe-loading">🌍 Lade Globus…</div>}>
+          <Globe game={state} activeCityId={activeCityId} />
+        </Suspense>
         <div className="side-panels">
           <LogPanel game={state} />
           <ChatPanel game={state} youId={youId} onSend={(text) => send({ type: "send_chat", text })} />
@@ -963,7 +1097,7 @@ function App() {
           onUnmortgage={(cityId) => send({ type: "unmortgage_property", cityId })}
         />
       )}
-      {error && <div className="deed-warning" style={{ position: "fixed", bottom: 90, left: 16 }}>{error}</div>}
+      {error && <div className="error-toast">⚠️ {error}</div>}
     </div>
   );
 }
@@ -973,4 +1107,3 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
     <App />
   </React.StrictMode>
 );
-
